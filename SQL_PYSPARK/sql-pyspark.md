@@ -396,3 +396,138 @@ spark.sql("DROP TABLE IF EXISTS workspace.source_schema.c_0abcdef")
 ---
 
 *End of system prompt. Begin conversion immediately upon receiving ODI input.*
+
+<!--
+  APPEND VERBATIM TO ALL FOUR INSTRUCTION FILES:
+  sql-sparksql.md, plsql-sparksql.md, sql-pyspark.md, plsql-pyspark.md
+  (in the GitHub instruction repo — see ../INSTRUCTION_ARCHITECTURE.md and the
+  README in this folder). These are general, client-agnostic rules. Do NOT put
+  per-user schema/source mapping data here — that is injected dynamically at
+  conversion time from each user's uploaded mapping.
+-->
+
+---
+
+## Staging Table Pattern (ODI transient objects)
+
+When converting ODI **transient staging objects** — tables whose names follow
+the ODI flow/staging prefixes `C$_`, `TC$_`, `I$_`, or `E$_`, and which are
+dropped and recreated within the same package/session — **prefer Spark
+temporary views or DataFrames over `CREATE TABLE` / `DROP TABLE` cycles.**
+
+- **Default (preferred):** materialize these transient steps as
+  `CREATE OR REPLACE TEMPORARY VIEW <name>` (or an intermediate DataFrame),
+  so the transient object lives only for the notebook run and needs no
+  `DROP TABLE ... PURGE` cleanup.
+- **This is a default, not an absolute.** Some clients require **persisted**
+  staging (e.g. for audit, restart/recovery, or downstream reads). If the
+  **schema mapping** designates the target schema for that object as persisted
+  staging (for example a `source_type` such as `internal_staging` pointing at a
+  real catalog.schema meant to hold staging tables), then keep it as a real
+  Delta table (`CREATE OR REPLACE TABLE ... USING DELTA`) instead of a temp
+  view.
+- When in doubt between the two, follow the schema mapping's intent for that
+  target schema; do not silently drop data that a persisted-staging design
+  expects to survive the run.
+
+```sql
+-- ✅ Default: transient C$/I$/E$ step as a temp view (no DROP needed)
+CREATE OR REPLACE TEMPORARY VIEW c_customer_stg AS
+SELECT ... FROM ...;
+
+-- ✅ Only when the mapping designates this schema as persisted staging:
+CREATE OR REPLACE TABLE workspace.<staging_schema>.c_customer_stg
+USING DELTA AS
+SELECT ... FROM ...;
+```
+
+---
+
+## Incremental Logic (watermark / control-table driven)
+
+When the source SQL filters against a **"previous load date" style comparison**
+— e.g. columns/variables matching patterns like `CURRENT_LOAD_DT`,
+`PREV_LOAD_DT`, `LAST_EXTRACT`/`CURRENT_EXTRACT` timestamps, or a lookup against
+an ETL control table — **do not just copy the literal `WHERE` clause into the
+Spark SQL.**
+
+Instead, generate an idempotent, restartable incremental pattern:
+
+1. **Read side:** filter the source using a watermark read from the existing
+   control table (follow the same shape as the `ETL_LOAD_INFO`-style control
+   tables already present in these source files — i.e. read the last-processed
+   watermark for this target, do not hard-code a literal date).
+2. **Apply side:** write changes with `MERGE INTO <target> AS T USING <source>
+   AS S ON <business_key>` — `WHEN MATCHED THEN UPDATE SET ...`,
+   `WHEN NOT MATCHED THEN INSERT ...` (explicit `AS T` / `AS S` aliases and
+   fully-qualified columns, per the Forbidden-Patterns MERGE rules).
+3. **Watermark update:** include the step that **advances the watermark** in the
+   control table after a successful load. Do not omit this — a read-side filter
+   without a watermark update is not a correct incremental load.
+
+```sql
+-- ✅ Shape (illustrative — resolve names from the source + schema mapping):
+-- 1) read the current watermark from the control table
+CREATE OR REPLACE TEMPORARY VIEW _wm AS
+SELECT last_extract_ts, current_extract_ts
+FROM workspace.<control_schema>.etl_load_info
+WHERE target_name = '<target_table>';
+
+-- 2) MERGE only rows changed within the watermark window
+MERGE INTO workspace.<schema>.<target> AS T
+USING (
+    SELECT s.*
+    FROM workspace.<schema>.<source> s, _wm
+    WHERE s.int_insert_date >  _wm.last_extract_ts
+      AND s.int_insert_date <= _wm.current_extract_ts
+) AS S
+ON T.<business_key> = S.<business_key>
+WHEN MATCHED THEN UPDATE SET ...
+WHEN NOT MATCHED THEN INSERT (...) VALUES (...);
+
+-- 3) advance the watermark after a successful load
+MERGE INTO workspace.<control_schema>.etl_load_info AS T
+USING (SELECT '<target_table>' AS target_name,
+              current_timestamp() AS new_ts) AS S
+ON T.target_name = S.target_name
+WHEN MATCHED THEN UPDATE SET T.last_extract_ts = S.new_ts;
+```
+
+> The exact watermark column names, control-table name, and business keys must
+> come from the actual source file and the schema mapping — the above is the
+> required *shape*, not literal names to copy.
+
+---
+
+## FLAG Comment Formats (exact, must not drift)
+
+Two situations require a machine-detected FLAG comment. An automated detector
+matches these by **exact pattern**, so reproduce the wording **verbatim** —
+including the em-dash `—` (U+2014), the single quotes around the schema name,
+and the uppercase keywords. Any drift silently breaks detection.
+
+**1. Unresolved schema** — the source references a schema that is not present in
+the (dynamically injected) schema mapping, or whose mapping is blank:
+
+```
+# FLAG: UNRESOLVED SCHEMA '<schema_name>' — no mapping provided. Requires manual review before this notebook can run.
+```
+
+**2. File load step with no configured landing path** — the source clearly
+performs a file load (SQL*Loader control file, `OdiOutFile` / `OdiSqlUnload`,
+external table over a flat file) and there is no matching file-source mapping
+entry (or the mapping's load pattern is unrecognized):
+
+```
+# FLAG: FILE LOAD STEP DETECTED — no landing path configured. Original load logic omitted, requires manual conversion.
+```
+
+In both cases, emit the FLAG as its own clearly marked cell and **continue
+converting the rest of the file normally** — a flag must never abort the rest
+of the conversion.
+
+> When a file-load step **does** match a configured file-source mapping entry,
+> do NOT emit the FILE LOAD flag — generate the real load cell (Auto Loader or
+> COPY INTO) as instructed by the dynamically injected FILE SOURCE MAPPING
+> block.
+
